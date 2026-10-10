@@ -1,0 +1,339 @@
+const SOURCE_ORIGIN = "https://akwam.ss";
+const SOURCE_HOST = "akwam.ss";
+const MEDIA_HOST_SUFFIXES = [".downet.net"];
+const UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.6 Mobile/15E148 Safari/604.1";
+
+function decodeEntities(value = "") {
+  return String(value)
+    .replace(/&amp;/g, "&")
+    .replace(/&quot;/g, '"')
+    .replace(/&#0*39;|&apos;/g, "'")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">");
+}
+
+function stripTags(value = "") {
+  return decodeEntities(String(value).replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim());
+}
+
+function absoluteUrl(value, base = SOURCE_ORIGIN) {
+  try { return new URL(decodeEntities(value), base).href; } catch { return ""; }
+}
+
+function safeHeaderUrl(value = "") {
+  try { return new URL(String(value)).href; } catch { return encodeURI(String(value)); }
+}
+
+export function assertSourceUrl(value, { allowMedia = false } = {}) {
+  const url = new URL(value);
+  const host = url.hostname.toLowerCase();
+  const sourceOk = url.protocol === "https:" && host === SOURCE_HOST;
+  const mediaOk = allowMedia && url.protocol === "https:" && MEDIA_HOST_SUFFIXES.some(suffix => host.endsWith(suffix));
+  if (!sourceOk && !mediaOk) throw new Error("UNSAFE_CINEMA_SOURCE_URL");
+  return url;
+}
+
+function sourcePathUrl(value, allowedKinds = []) {
+  const href = absoluteUrl(value);
+  if (!href) return "";
+  try {
+    const url = assertSourceUrl(href);
+    const kind = url.pathname.split("/").filter(Boolean)[0] || "";
+    if (allowedKinds.length && !allowedKinds.includes(kind)) return "";
+    return url.href;
+  } catch {
+    return "";
+  }
+}
+
+function sourceAnchorMatches(html = "", allowedKinds = []) {
+  const out = [];
+  const anchorRe = /<a\b([^>]*?)href=["']([^"']+)["']([^>]*)>([\s\S]*?)<\/a>/gi;
+  let match;
+  while ((match = anchorRe.exec(html))) {
+    const href = sourcePathUrl(match[2], allowedKinds);
+    if (!href) continue;
+    out.push({ href, before: match[1], after: match[3], body: match[4], index: match.index });
+  }
+  return out;
+}
+
+export async function fetchSourceHtml(value, { referer = SOURCE_ORIGIN + "/", timeoutMs = 30_000 } = {}) {
+  const url = assertSourceUrl(value);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, {
+      method: "GET",
+      redirect: "follow",
+      cache: "no-store",
+      signal: controller.signal,
+      headers: {
+        Accept: "text/html,application/xhtml+xml",
+        "Accept-Language": "ar-SA,ar;q=0.9,en-US;q=0.8,en;q=0.7",
+        "User-Agent": UA,
+        Referer: safeHeaderUrl(referer),
+      },
+    });
+    if (!response.ok) throw new Error(`CINEMA_SOURCE_HTTP_${response.status}`);
+    return { html: await response.text(), url: response.url || url.href };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function contentKind(url) {
+  try {
+    const path = new URL(url).pathname;
+    if (path.startsWith("/series/")) return "series";
+    if (path.startsWith("/movie/") || path.startsWith("/movies/")) return "movie";
+  } catch {}
+  return "series";
+}
+
+function catalogEntry(block, seen) {
+  const anchor = sourceAnchorMatches(block, ["series", "movie", "movies"])[0];
+  if (!anchor) return null;
+  const href = anchor.href;
+  if (seen.has(href)) return null;
+  seen.add(href);
+  const imgMatch = block.match(/<img[^>]+(?:data-src|src)=["']([^"']+)["'][^>]*alt=["']([^"']*)["']/i)
+    || block.match(/<img[^>]+alt=["']([^"']*)["'][^>]+(?:data-src|src)=["']([^"']+)["']/i);
+  let img = "";
+  let alt = "";
+  if (imgMatch) {
+    if (/^https?:/i.test(imgMatch[1]) || imgMatch[1].startsWith("/")) { img = absoluteUrl(imgMatch[1]); alt = imgMatch[2] || ""; }
+    else { alt = imgMatch[1] || ""; img = absoluteUrl(imgMatch[2] || ""); }
+  }
+  const titleMatch = block.match(/<h3[^>]*class=["'][^"']*entry-title[^"']*["'][^>]*>[\s\S]*?<a[^>]*>([\s\S]*?)<\/a>/i);
+  const yearMatch = block.match(/<span[^>]*class=["'][^"']*badge[^"']*secondary[^"']*["'][^>]*>\s*(\d{4})\s*<\/span>/i);
+  const title = stripTags(titleMatch?.[1] || anchor.body || alt || "بدون عنوان");
+  return { title, img, is_series: contentKind(href) !== "movie", href, year: yearMatch?.[1] || null };
+}
+
+export function parseCatalog(html = "") {
+  const out = [];
+  const seen = new Set();
+  const boxRe = /<div\s+class=["'][^"']*entry-box\s+entry-box-1[^"']*["'][^>]*>([\s\S]*?)(?=<div\s+class=["'][^"']*entry-box\s+entry-box-1|$)/gi;
+  let match;
+  while ((match = boxRe.exec(html))) {
+    const entry = catalogEntry(match[1], seen);
+    if (entry) out.push(entry);
+  }
+  if (!out.length) {
+    for (const anchor of sourceAnchorMatches(html, ["series", "movie", "movies"])) {
+      if (seen.has(anchor.href)) continue;
+      seen.add(anchor.href);
+      const title = stripTags(anchor.body) || "بدون عنوان";
+      out.push({ title, img: "", is_series: contentKind(anchor.href) !== "movie", href: anchor.href, year: null });
+    }
+  }
+  return out;
+}
+
+function parseJsonLd(html = "") {
+  const objects = [];
+  for (const m of html.matchAll(/<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)) {
+    try {
+      const value = JSON.parse(m[1].trim());
+      if (Array.isArray(value)) objects.push(...value); else objects.push(value);
+    } catch {}
+  }
+  return objects;
+}
+
+function pageTitle(html = "") {
+  const ld = parseJsonLd(html).find(x => x && typeof x === "object" && (x.name || x.headline));
+  if (ld?.name || ld?.headline) return String(ld.name || ld.headline);
+  const h1 = html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i);
+  if (h1) return stripTags(h1[1]);
+  const title = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+  return stripTags(title?.[1] || "");
+}
+
+function pagePoster(html = "") {
+  const ld = parseJsonLd(html).find(x => x && typeof x === "object" && x.image);
+  if (Array.isArray(ld?.image) && ld.image[0]) return absoluteUrl(ld.image[0]);
+  if (typeof ld?.image === "string") return absoluteUrl(ld.image);
+  const img = html.match(/<img[^>]+(?:class=["'][^"']*(?:poster|movie-poster|img-fluid)[^"']*["'][^>]+)?(?:data-src|src)=["']([^"']+)["']/i);
+  return img ? absoluteUrl(img[1]) : "";
+}
+
+function episodeIdentity(href = "", label = "", fallback = 0) {
+  let decoded = String(href || "");
+  try { decoded = decodeURIComponent(decoded); } catch {}
+  const cleanLabel = String(label || "");
+  const explicit = [
+    cleanLabel.match(/(?:الحلقة|episode)[\s\-_/:]*(\d{1,4})(?:\D|$)/i),
+    cleanLabel.trim().match(/^(\d{1,4})$/),
+    decoded.match(/(?:الحلقة|episode)[\s\-_/:]*(\d{1,4})(?:\D|$)/i),
+  ].find(Boolean);
+  const idMatch = decoded.match(/\/episode\/(\d+)(?:\/|$)/i);
+  const number = Number(explicit?.[1] || fallback || 0);
+  return {
+    episode_number: Number.isFinite(number) && number > 0 ? number : null,
+    episode_id: idMatch?.[1] || null,
+  };
+}
+
+function normalizeEpisodes(entries = []) {
+  if (!entries.length) return [];
+  const ordered = [...entries].sort((a, b) => Number(a.episode_number || 0) - Number(b.episode_number || 0));
+  const seenNumbers = new Set();
+  const deduped = [];
+  let suspicious = false;
+
+  for (const entry of ordered) {
+    const n = Number(entry.episode_number || 0);
+    if (!Number.isFinite(n) || n <= 0 || n > 1000) {
+      suspicious = true;
+      deduped.push(entry);
+      continue;
+    }
+    if (seenNumbers.has(n)) {
+      suspicious = true;
+      continue;
+    }
+    seenNumbers.add(n);
+    deduped.push(entry);
+  }
+
+  const nums = deduped.map(ep => Number(ep.episode_number || 0)).filter(n => Number.isFinite(n) && n > 0);
+  if (nums.length && (nums[0] !== 1 || nums.some((n, i) => i > 0 && n !== nums[i - 1] + 1))) suspicious = true;
+
+  return deduped.map((episode, index) => {
+    const display = suspicious ? index + 1 : Number(episode.episode_number || index + 1);
+    return { ...episode, num: display, episode_number: display };
+  });
+}
+
+export function parseDetails(html = "", pageUrl = "") {
+  const episodes = [];
+  const seen = new Set();
+  for (const anchor of sourceAnchorMatches(html, ["episode"])) {
+    const href = anchor.href;
+    if (seen.has(href)) continue;
+    seen.add(href);
+    const attrs = `${anchor.before} ${anchor.after}`;
+    const label = stripTags(`${attrs.match(/(?:title|aria-label)=["']([^"']+)["']/i)?.[1] || ""} ${anchor.body || ""}`);
+    const identity = episodeIdentity(href, label, episodes.length + 1);
+    episodes.push({
+      num: identity.episode_number || episodes.length + 1,
+      episode_number: identity.episode_number || episodes.length + 1,
+      episode_id: identity.episode_id,
+      link: href,
+      watch_available: true,
+    });
+  }
+  const normalizedEpisodes = normalizeEpisodes(episodes);
+  return {
+    status: "success",
+    source: "basri-direct",
+    movie_title: pageTitle(html),
+    poster: pagePoster(html),
+    episodes: normalizedEpisodes,
+    page_url: pageUrl,
+  };
+}
+
+export function parseEpisode(html = "", pageUrl = "") {
+  const watch = [];
+  const downloads = [];
+  for (const anchor of sourceAnchorMatches(html, ["watch", "download"])) {
+    const url = anchor.href;
+    const kind = new URL(url).pathname.split("/").filter(Boolean)[0] || "";
+    const block = html.slice(anchor.index, Math.min(html.length, anchor.index + 700));
+    const size = stripTags(block.match(/font-size-14[^>]*>([\s\S]*?)<\/span>/i)?.[1] || "");
+    if (kind === "watch" && !watch.includes(url)) watch.push(url);
+    if (kind === "download" && !downloads.some(x => x.url === url)) downloads.push({ url, size: size || null });
+  }
+  return { status: "success", source: "basri-direct", movie_title: pageTitle(html), watch, downloads, page_url: pageUrl };
+}
+
+export function mediaKindFromUrl(value = "") {
+  let path = "";
+  try { path = new URL(value).pathname.toLowerCase(); } catch { return "unknown"; }
+  if (/\.m3u8$/.test(path)) return "hls";
+  if (/\.(?:ts|m2ts)$/.test(path)) return "mpeg-ts";
+  if (/\.mp4$/.test(path)) return "mp4";
+  if (/\.webm$/.test(path)) return "webm";
+  if (/\.mkv$/.test(path)) return "matroska";
+  return "unknown";
+}
+
+function isMediaCandidate(value = "") {
+  const kind = mediaKindFromUrl(value);
+  if (kind !== "unknown") return true;
+  try {
+    const url = new URL(value);
+    return MEDIA_HOST_SUFFIXES.some(suffix => url.hostname.toLowerCase().endsWith(suffix))
+      && /\/(?:download|stream|media|video)\//i.test(url.pathname);
+  } catch {
+    return false;
+  }
+}
+
+export function rankMediaCandidates(candidates = []) {
+  const rank = kind => ({ mp4: 0, hls: 1, "mpeg-ts": 2, webm: 3, matroska: 4, unknown: 5 }[kind] ?? 9);
+  return [...candidates].sort((a, b) => rank(mediaKindFromUrl(a)) - rank(mediaKindFromUrl(b)));
+}
+
+export function parseWatch(html = "", pageUrl = "") {
+  const candidates = [];
+  for (const re of [
+    /<source[^>]+src=["']([^"']+)["']/gi,
+    /<video[^>]+src=["']([^"']+)["']/gi,
+    /(?:file|src)\s*[:=]\s*["'](https?:\/\/[^"']+)["']/gi,
+  ]) {
+    for (const m of html.matchAll(re)) {
+      const url = absoluteUrl(m[1], pageUrl || SOURCE_ORIGIN);
+      if (!url || candidates.includes(url) || !isMediaCandidate(url)) continue;
+      try { assertSourceUrl(url, { allowMedia: true }); candidates.push(url); } catch {}
+    }
+  }
+  const preferred = rankMediaCandidates(candidates);
+  return {
+    status: preferred.length ? "success" : "error",
+    source: "basri-direct",
+    media_src: preferred[0] || "",
+    media_type: mediaKindFromUrl(preferred[0] || ""),
+    candidates: preferred,
+    movie_title: pageTitle(html),
+    page_url: pageUrl,
+  };
+}
+
+export async function directCategory(sourceUrl, page = 1) {
+  const url = assertSourceUrl(sourceUrl);
+  if (page > 1) url.searchParams.set("page", String(page));
+  const { html } = await fetchSourceHtml(url.href);
+  return parseCatalog(html);
+}
+
+export async function directSearch(query) {
+  const url = new URL("/search", SOURCE_ORIGIN);
+  url.searchParams.set("q", String(query || "").trim());
+  const { html } = await fetchSourceHtml(url.href);
+  return parseCatalog(html);
+}
+
+export async function directDetails(target) {
+  const url = assertSourceUrl(target);
+  const { html } = await fetchSourceHtml(url.href);
+  if (url.pathname.startsWith("/episode/")) return parseEpisode(html, url.href);
+  const details = parseDetails(html, url.href);
+  if (contentKind(url.href) === "movie") {
+    const direct = parseEpisode(html, url.href);
+    return { ...details, watch: direct.watch, downloads: direct.downloads };
+  }
+  return details;
+}
+
+export async function directWatch(target, referer = SOURCE_ORIGIN + "/") {
+  const url = assertSourceUrl(target);
+  if (!url.pathname.startsWith("/watch/")) throw new Error("BAD_WATCH_REFERENCE");
+  const { html } = await fetchSourceHtml(url.href, { referer });
+  return parseWatch(html, url.href);
+}
+
+export const BasriSource = Object.freeze({ origin: SOURCE_ORIGIN, userAgent: UA });

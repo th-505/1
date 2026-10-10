@@ -1,0 +1,262 @@
+#!/usr/bin/env node
+const MATCHES = "https://api.albasritv1.workers.dev/";
+const NEWS = "https://news.albesriali03.workers.dev/";
+const CINEMA = "https://albas.albesriali03.workers.dev/";
+const SOURCE = "https://akwam.ss";
+const ORIGIN = "https://www.albasritv.abrdns.com";
+const SAFARI_UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.6 Mobile/15E148 Safari/604.1";
+
+async function request(url, init = {}, timeoutMs = 45000) {
+  const started = Date.now();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { ...init, signal: controller.signal, cache: "no-store", redirect: "follow" });
+    const text = await res.text();
+    let data = null;
+    try { data = JSON.parse(text); } catch {}
+    return { ok: res.ok, status: res.status, headers: res.headers, data, text, ms: Date.now() - started, finalUrl: res.url };
+  } finally { clearTimeout(timer); }
+}
+
+function assert(cond, message, detail = {}) {
+  if (!cond) {
+    console.error("FAIL", message, detail);
+    process.exitCode = 1;
+    return false;
+  }
+  console.log("PASS", message, detail);
+  return true;
+}
+
+const safeRef = value => {
+  const raw = String(value || "");
+  try {
+    const url = new URL(raw);
+    url.pathname = url.pathname.split("/").map(segment => encodeURIComponent(decodeURIComponent(segment))).join("/");
+    return url.href;
+  } catch {
+    return encodeURI(raw);
+  }
+};
+const jsonHeaders = (page, extra = {}) => ({
+  Accept: "application/json",
+  Origin: ORIGIN,
+  Referer: safeRef(ORIGIN + page),
+  "X-BSR-Page": page,
+  ...extra,
+});
+const htmlHeaders = (referer = SOURCE + "/") => ({
+  Accept: "text/html,application/xhtml+xml",
+  "Accept-Language": "ar-SA,ar;q=0.9,en-US;q=0.8,en;q=0.7",
+  "User-Agent": SAFARI_UA,
+  Referer: safeRef(referer),
+});
+
+function uniqueMatches(text, re) {
+  const out = [];
+  for (const m of text.matchAll(re)) if (!out.includes(m[1])) out.push(m[1]);
+  return out;
+}
+
+function sourceLinks(text, kind) {
+  const out = [];
+  for (const m of text.matchAll(/href=["']([^"']+)["']/gi)) {
+    try {
+      const url = new URL(m[1], SOURCE + "/");
+      if (url.protocol !== "https:" || url.hostname !== "akwam.ss" || !url.pathname.startsWith(`/${kind}/`)) continue;
+      if (!out.includes(url.href)) out.push(url.href);
+    } catch {}
+  }
+  return out;
+}
+
+function sanitizeSnippet(value = "") {
+  return String(value)
+    .replace(/https?:\/\/[^\s"'`)]+/g, "[url]")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function safeHtmlDiagnostics(text) {
+  const title = String(text.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1] || "")
+    .replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim().slice(0, 160);
+  const hrefs = [];
+  for (const m of text.matchAll(/href=["']([^"']+)["']/gi)) {
+    if (hrefs.length >= 20) break;
+    try {
+      const url = new URL(m[1], SOURCE + "/");
+      hrefs.push({ host: url.hostname, path: url.pathname.slice(0, 180) });
+    } catch {
+      hrefs.push({ host: "invalid", path: String(m[1]).slice(0, 180) });
+    }
+  }
+  const scripts = [];
+  for (const m of text.matchAll(/<script\b[^>]*src=["']([^"']+)["'][^>]*>/gi)) {
+    if (scripts.length >= 20) break;
+    try {
+      const url = new URL(m[1], SOURCE + "/");
+      scripts.push({ host: url.hostname, path: url.pathname.slice(0, 180) });
+    } catch {
+      scripts.push({ host: "invalid", path: String(m[1]).slice(0, 180) });
+    }
+  }
+  const markers = [...text.matchAll(/(?:fetch|ajax|section|series|load|recent)[^\n<>]{0,120}/gi)]
+    .slice(0, 20)
+    .map((m) => sanitizeSnippet(m[0]).slice(0, 160));
+  return { title, hrefs, scripts, markers };
+}
+
+function safeDynamicDiagnostics(text) {
+  const inputs = [];
+  for (const m of text.matchAll(/<input\b([^>]*)>/gi)) {
+    if (inputs.length >= 30) break;
+    const attrs = m[1];
+    const type = attrs.match(/\btype=["']([^"']+)["']/i)?.[1] || "";
+    const name = attrs.match(/\bname=["']([^"']+)["']/i)?.[1] || "";
+    const id = attrs.match(/\bid=["']([^"']+)["']/i)?.[1] || "";
+    const value = attrs.match(/\bvalue=["']([^"']*)["']/i)?.[1] || "";
+    if (!type && !name && !id && !value) continue;
+    inputs.push({ type, name, id, value: sanitizeSnippet(value).slice(0, 120) });
+  }
+
+  const dataAttrs = [];
+  for (const m of text.matchAll(/\b(data-[a-z0-9_-]+)=["']([^"']*)["']/gi)) {
+    if (dataAttrs.length >= 40) break;
+    const pair = { name: m[1], value: sanitizeSnippet(m[2]).slice(0, 140) };
+    if (!dataAttrs.some(x => x.name === pair.name && x.value === pair.value)) dataAttrs.push(pair);
+  }
+
+  const forms = [];
+  for (const m of text.matchAll(/<form\b([^>]*)>/gi)) {
+    if (forms.length >= 20) break;
+    const attrs = m[1];
+    forms.push({
+      action: sanitizeSnippet(attrs.match(/\baction=["']([^"']*)["']/i)?.[1] || "").slice(0, 160),
+      method: attrs.match(/\bmethod=["']([^"']*)["']/i)?.[1] || "",
+      id: attrs.match(/\bid=["']([^"']*)["']/i)?.[1] || "",
+      className: attrs.match(/\bclass=["']([^"']*)["']/i)?.[1] || "",
+    });
+  }
+
+  const inline = [];
+  for (const m of text.matchAll(/<script\b(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/gi)) {
+    const body = m[1];
+    if (!/(?:ajax|fetch|loader|load|section|page|recent|entry|series|movie)/i.test(body)) continue;
+    for (const line of body.split(/\r?\n/)) {
+      if (!/(?:ajax|fetch|loader|load|section|page|recent|entry|series|movie|url\s*:|data\s*:)/i.test(line)) continue;
+      const snippet = sanitizeSnippet(line).slice(0, 500);
+      if (snippet && !inline.includes(snippet)) inline.push(snippet);
+      if (inline.length >= 40) break;
+    }
+    if (inline.length >= 40) break;
+  }
+
+  return { inputs, dataAttrs, forms, inline };
+}
+
+function safeJsDiagnostics(text) {
+  const lines = String(text).split(/\r?\n/);
+  const out = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (!/(?:\$\.ajax|ajax\(|fetch\(|url\s*:|data\s*:|type\s*:|method\s*:|success\s*:|recently|entry-box|section|load)/i.test(lines[i])) continue;
+    const start = Math.max(0, i - 1);
+    const end = Math.min(lines.length, i + 3);
+    const snippet = sanitizeSnippet(lines.slice(start, end).join(" ")).slice(0, 420);
+    if (snippet && !out.includes(snippet)) out.push(snippet);
+    if (out.length >= 40) break;
+  }
+  return out;
+}
+
+async function matchesSmoke() {
+  const page = "/2026/09/matches.html";
+  const session = await request(MATCHES + "session", { headers: jsonHeaders(page) });
+  if (!assert(session.ok && session.data?.success === true && session.data?.token, "matches session", { status: session.status, ms: session.ms })) return;
+  const list = await request(MATCHES, { headers: jsonHeaders(page, { "X-BSR-Token": String(session.data.token) }) });
+  if (assert(list.ok && list.data?.success === true && Array.isArray(list.data?.data) && list.data.data.length > 0, "matches list", { status: list.status, count: list.data?.data?.length, ms: list.ms })) {
+    const sample = list.data.data.slice(0, 4).map(match => ({
+      keys: Object.keys(match || {}),
+      team1: match?.team1,
+      team2: match?.team2,
+      homeLogoFields: Object.fromEntries(Object.entries(match || {}).filter(([key]) => /(?:team1|home).*(?:logo|image|img|badge|crest|icon|photo|avatar)/i.test(key))),
+      awayLogoFields: Object.fromEntries(Object.entries(match || {}).filter(([key]) => /(?:team2|away).*(?:logo|image|img|badge|crest|icon|photo|avatar)/i.test(key))),
+    }));
+    console.log("INFO match logo payload sample", JSON.stringify(sample, null, 2));
+  }
+}
+
+async function workerProbe() {
+  const page = "/2026/09/movies-series.html";
+  const probe = await request(CINEMA + "session", { headers: jsonHeaders(page) }, 20000);
+  if (probe.ok && probe.data?.token) console.log("INFO cinema worker session available", { status: probe.status, ms: probe.ms });
+  else console.log("INFO cinema worker unavailable; backend direct fallback is required", { status: probe.status, message: probe.data?.message || "", ms: probe.ms });
+}
+
+async function cinemaDirectSmoke() {
+  const category = await request(SOURCE + "/series?section=30", { headers: htmlHeaders() });
+  if (!assert(category.ok && category.text.length > 1000, "direct cinema category HTML", { status: category.status, bytes: category.text.length, ms: category.ms })) return;
+  const series = sourceLinks(category.text, "series");
+  if (!series.length) {
+    console.log("INFO direct cinema HTML diagnostics", JSON.stringify(safeHtmlDiagnostics(category.text)));
+    console.log("INFO direct cinema dynamic diagnostics", JSON.stringify(safeDynamicDiagnostics(category.text)));
+    const js = await request(SOURCE + "/style/assets/js/akwam.js", { headers: htmlHeaders(SOURCE + "/series?section=30") }, 20000);
+    console.log("INFO direct cinema loader diagnostics", JSON.stringify({ status: js.status, bytes: js.text.length, markers: safeJsDiagnostics(js.text) }));
+  }
+  if (!assert(series.length > 0, "direct cinema category has items", { count: series.length })) return;
+
+  const search = await request(SOURCE + "/search?q=" + encodeURIComponent("الذئب الوحيد"), { headers: htmlHeaders() });
+  assert(search.ok, "direct cinema search reachable", { status: search.status, bytes: search.text.length, ms: search.ms });
+
+  const detail = await request(series[0], { headers: htmlHeaders(SOURCE + "/series?section=30") });
+  if (!assert(detail.ok, "direct cinema details", { status: detail.status, ms: detail.ms })) return;
+  const episodes = sourceLinks(detail.text, "episode");
+  if (!assert(episodes.length > 0, "direct cinema details has episodes", { count: episodes.length })) return;
+
+  const episode = await request(episodes.at(-1), { headers: htmlHeaders(series[0]) });
+  if (!assert(episode.ok, "direct cinema episode", { status: episode.status, ms: episode.ms })) return;
+  const watch = sourceLinks(episode.text, "watch");
+  if (!assert(watch.length > 0, "direct cinema episode has watch source", { count: watch.length })) return;
+
+  const watchPage = await request(watch[0], { headers: htmlHeaders(episodes.at(-1)) });
+  if (!assert(watchPage.ok, "direct cinema watch page", { status: watchPage.status, ms: watchPage.ms })) return;
+  const media = uniqueMatches(watchPage.text, /<source[^>]+src=["'](https:\/\/[^"']+)["']/gi);
+  if (!assert(media.length > 0, "direct cinema watch resolves media", { count: media.length })) return;
+
+  try {
+    const range = await fetch(media[0], {
+      method: "GET",
+      redirect: "follow",
+      headers: { Range: "bytes=0-1023", Referer: safeRef(watch[0]), "User-Agent": SAFARI_UA, Accept: "*/*" },
+    });
+    try {
+      assert(range.status === 206 || range.status === 200, "direct media responds to Safari range probe", {
+        status: range.status,
+        contentRange: range.headers.get("content-range") || "",
+        acceptRanges: range.headers.get("accept-ranges") || "",
+        contentType: range.headers.get("content-type") || "",
+      });
+    } finally {
+      try { await range.body?.cancel(); } catch {}
+    }
+  } catch (error) {
+    const code = String(error?.cause?.code || error?.code || "");
+    if (["UNABLE_TO_VERIFY_LEAF_SIGNATURE", "SELF_SIGNED_CERT_IN_CHAIN", "DEPTH_ZERO_SELF_SIGNED_CERT"].includes(code)) {
+      console.log("INFO direct media has legacy TLS chain; backend proxy compatibility path must handle it", { code });
+    } else {
+      throw error;
+    }
+  }
+}
+
+async function newsSmoke() {
+  const page = "/2026/09/news.html";
+  const result = await request(NEWS + "?_=" + Date.now(), { headers: jsonHeaders(page) });
+  const shapeOk = result.ok && result.data && (result.data.status === "success" || result.data.success === true);
+  assert(shapeOk, "news JSON endpoint", { status: result.status, ms: result.ms });
+}
+
+await matchesSmoke().catch(e => { console.error("FAIL matches smoke", e); process.exitCode = 1; });
+await workerProbe().catch(e => console.log("INFO cinema worker probe failed", String(e?.message || e)));
+await cinemaDirectSmoke().catch(e => { console.error("FAIL direct cinema smoke", e); process.exitCode = 1; });
+await newsSmoke().catch(e => { console.error("FAIL news smoke", e); process.exitCode = 1; });
