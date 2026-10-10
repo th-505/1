@@ -3,9 +3,10 @@ import { createServer } from "./app.mjs";
 import { createNewsRuntime } from "./news-runtime.mjs";
 import { createProductionMatchRuntime } from "./match-production.mjs";
 
-const MATCH_LOGO_HOSTS = new Set(["kooorracity.com", "www.kooorracity.com"]);
+const MATCH_LOGO_HOSTS = new Set(["kooorracity.com", "www.kooorracity.com", "koooracity.news", "www.koooracity.news"]);
 const ALLOWED_ORIGINS = new Set([
   "https://theeb1230-dot.github.io",
+  "https://th-505.github.io",
   "http://localhost:8000",
   "http://127.0.0.1:8000",
 ]);
@@ -28,7 +29,7 @@ function applyLogoCors(req, res) {
 function isAllowedMatchLogoUrl(value) {
   try {
     const url = new URL(String(value || ""));
-    return url.protocol === "https:" && MATCH_LOGO_HOSTS.has(url.hostname.toLowerCase()) && url.pathname.startsWith("/wp-content/uploads/");
+    return url.protocol === "https:" && !url.username && !url.password && !url.port && MATCH_LOGO_HOSTS.has(url.hostname.toLowerCase()) && url.pathname.startsWith("/wp-content/uploads/");
   } catch {
     return false;
   }
@@ -56,10 +57,10 @@ async function proxyMatchLogo(req, res, url) {
   try {
     const upstream = await fetch(source, {
       signal: controller.signal,
-      redirect: "follow",
+      redirect: "error",
       headers: {
         Accept: "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
-        Referer: "https://kooorracity.com/",
+        Referer: new URL(source).origin + "/",
         "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_6 like Mac OS X) AppleWebKit/605.1.15 Safari/604.1",
       },
     });

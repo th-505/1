@@ -1,10 +1,11 @@
 #!/usr/bin/env node
 
 const BASE = process.env.AL_QAHTANI_BASE || "https://al-qahtani-api.onrender.com";
-const ALLOWED = "https://theeb1230-dot.github.io";
+const ALLOWED = process.env.AL_QAHTANI_WEB_ORIGIN || "https://th-505.github.io";
 const REJECTED = [
   "https://evil.example",
   "https://theeb1230-dot.github.io.evil.example",
+  "https://th-505.github.io.evil.example",
   "null",
 ];
 

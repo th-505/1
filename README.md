@@ -1,6 +1,6 @@
 # Al-Qahtani
 
-GitHub Pages: https://theeb1230-dot.github.io/Al-Qahtani/
+GitHub Pages: https://th-505.github.io/1/
 
 Clean-room continuation of the uploaded Albasri TV web project, preserving working behavior while removing advertising/legacy app coupling and preparing a provider-based Flutter migration.
 

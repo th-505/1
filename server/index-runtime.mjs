@@ -6,6 +6,7 @@ import { createFallbackPlaybackRuntime } from "./fallback-runtime.mjs";
 
 const ALLOWED_ORIGINS = new Set([
   "https://theeb1230-dot.github.io",
+  "https://th-505.github.io",
   "http://localhost:8000",
   "http://127.0.0.1:8000",
 ]);
